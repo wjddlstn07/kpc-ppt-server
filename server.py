@@ -31,6 +31,30 @@ def health_check():
     return jsonify({"status": "ok", "message": "PPT 생성 서버 가동 중"})
 
 
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    if "template" not in request.files:
+        return jsonify({"error": "template 파일이 필요합니다 (multipart/form-data)"}), 400
+
+    template_file = request.files["template"]
+
+    if not template_file.filename or not template_file.filename.lower().endswith(".pptx"):
+        return jsonify({"error": "템플릿 파일은 .pptx 형식이어야 합니다"}), 400
+
+    tmp_dir = tempfile.mkdtemp(prefix="ppt_analyze_")
+    template_path = os.path.join(tmp_dir, "template.pptx")
+
+    try:
+        template_file.save(template_path)
+        result = analyze_template(template_path)
+    except Exception as e:
+        return jsonify({"error": f"템플릿 분석 실패: {e}"}), 500
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return jsonify(result)
+
+
 @app.route("/generate-ppt", methods=["POST"])
 def generate_ppt():
     # ── 입력 검증 ──────────────────────────────
