@@ -86,10 +86,29 @@ def build_ppt(template_path: str, slides_json: dict, output_path: str) -> str:
     if not slides_data:
         raise ValueError("slides_json에 슬라이드 데이터가 없습니다.")
 
-    for slide_data in slides_data:
-        layout = _find_layout(prs, slide_data.get("layout", ""))
+    for slide_idx, slide_data in enumerate(slides_data):
+        layout_name = slide_data.get("layout", "")
+        print(f"\n[슬라이드 {slide_idx + 1}] 요청 layout_name: '{layout_name}'")
+
+        layout = _find_layout(prs, layout_name)
+        print(f"[슬라이드 {slide_idx + 1}] 선택된 레이아웃: '{layout.name}'")
+
         slide = prs.slides.add_slide(layout)
+
+        ph_idxs = [ph.placeholder_format.idx for ph in slide.placeholders]
+        print(f"[슬라이드 {slide_idx + 1}] 플레이스홀더 idx 목록: {ph_idxs}")
+
         _fill_slide(slide, slide_data)
+
+        filled = {}
+        for ph in slide.placeholders:
+            idx = ph.placeholder_format.idx
+            try:
+                text = ph.text_frame.text.strip()
+                filled[idx] = bool(text)
+            except Exception:
+                filled[idx] = False
+        print(f"[슬라이드 {slide_idx + 1}] 텍스트 채움 여부 (idx: 채워짐): {filled}")
 
     prs.save(output_path)
     return output_path
@@ -100,6 +119,9 @@ def _remove_all_slides(prs: Presentation) -> None:
     R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
     sld_id_lst = prs.slides._sldIdLst
 
+    before_count = len(prs.slides)
+    print(f"[_remove_all_slides] 제거 전 슬라이드 수: {before_count}")
+
     for sld_id_elem in list(sld_id_lst):
         rId = sld_id_elem.get(R_ID)
         try:
@@ -107,6 +129,9 @@ def _remove_all_slides(prs: Presentation) -> None:
         except Exception:
             pass
         sld_id_lst.remove(sld_id_elem)
+
+    after_count = len(prs.slides)
+    print(f"[_remove_all_slides] 제거 후 슬라이드 수: {after_count}")
 
 
 def _find_layout(prs: Presentation, layout_name: str):
