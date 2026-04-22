@@ -120,11 +120,13 @@ SYSTEM_PROMPT = """\
 }
 
 규칙:
-- 첫 번째 슬라이드는 반드시 표지 (layout: "제목 슬라이드" 또는 가장 가까운 레이아웃)
+- 첫 번째 슬라이드는 반드시 표지 (아래 "실제 템플릿 슬라이드 구조"에서 index=0인 슬라이드의 layout_name 사용)
 - 마지막 슬라이드는 마무리 / Q&A 슬라이드
 - bullets와 content는 하나만 사용 (bullets 우선)
 - 슬라이드당 bullets는 최대 5개
-- layout 값은 반드시 제공된 "사용 가능한 레이아웃 목록" 중 하나를 정확히 사용
+- layout 값은 반드시 "실제 템플릿 슬라이드 구조"의 layout_name 중 하나를 철자 그대로 사용할 것
+  - "사용 가능한 레이아웃 목록"은 전체 후보이며, 실제 템플릿에서 쓰인 레이아웃을 우선적으로 선택할 것
+  - 적합한 레이아웃이 없을 경우에만 "사용 가능한 레이아웃 목록"에서 선택
 """
 
 
@@ -138,6 +140,17 @@ def generate_slides_json(content: str, template_analysis: dict) -> dict:
         f"{template_analysis.get('slide_width_inches', 13.33):.2f}\" × "
         f"{template_analysis.get('slide_height_inches', 7.5):.2f}\""
     )
+    existing_slides = template_analysis.get("existing_slides", [])
+
+    existing_slides_lines = []
+    for s in existing_slides:
+        shapes_preview = ", ".join(
+            f'"{sh["name"]}: {sh["text_preview"]}"' for sh in s["shapes"]
+        ) if s["shapes"] else "없음"
+        existing_slides_lines.append(
+            f'  - index={s["index"]}, layout_name="{s["layout_name"]}", shapes=[{shapes_preview}]'
+        )
+    existing_slides_str = "\n".join(existing_slides_lines) if existing_slides_lines else "  (없음)"
 
     user_message = f"""\
 다음 정보를 바탕으로 PPT 슬라이드 JSON을 생성해주세요.
@@ -146,6 +159,10 @@ def generate_slides_json(content: str, template_analysis: dict) -> dict:
 - 슬라이드 크기: {slide_size}
 - 사용 가능한 레이아웃 목록: {json.dumps(layout_names, ensure_ascii=False)}
 - 템플릿 폰트: {', '.join(fonts) if fonts else '기본 폰트'}
+
+## 실제 템플릿 슬라이드 구조
+(템플릿에 원래 포함된 슬라이드 — layout_name을 layout 값으로 그대로 사용하세요)
+{existing_slides_str}
 
 ## 프로젝트 내용
 {content}

@@ -156,8 +156,13 @@ def _find_layout(prs: Presentation, layout_name: str):
             if fallback_idx < len(prs.slide_layouts):
                 return prs.slide_layouts[fallback_idx]
 
-    # 3) 기본값: 두 번째 레이아웃(제목+내용)
-    return prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
+    # 3) 기본값: 플레이스홀더가 하나 이상 있는 첫 번째 레이아웃
+    for layout in prs.slide_layouts:
+        if layout.placeholders:
+            return layout
+
+    # 4) 플레이스홀더가 있는 레이아웃조차 없으면 첫 번째 레이아웃 반환
+    return prs.slide_layouts[0]
 
 
 def _fill_slide(slide, slide_data: dict) -> None:
