@@ -1,106 +1,57 @@
 """
-server.py - PPT 자동 생성 Flask 서버
+server.py - KPC PPT 생성 Flask 서버
 """
-import io
 import json
 import os
-import shutil
 import tempfile
-import uuid
 
-import anthropic
 from flask import Flask, jsonify, request, send_file
-from werkzeug.utils import secure_filename
-
 from ppt_builder import analyze_template, build_ppt
+import anthropic
 
 app = Flask(__name__)
 
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
-
 
 # ──────────────────────────────────────────────
-# Claude API 시스템 프롬프트
+# 헬퍼: 슬라이드별 real_body 개수 추출
 # ──────────────────────────────────────────────
 
-PPT_SYSTEM_PROMPT = """당신은 컨설팅 프로젝트 PPT 구조화 전문가입니다.
-
-사용자가 입력한 프로젝트 내용(줄글)과 템플릿 분석 결과를 바탕으로,
-슬라이드 구성 JSON을 생성해주세요.
-
-## 출력 규칙
-- 반드시 JSON만 출력 (설명 텍스트, 마크다운 코드블록 없음)
-- 한국어로 작성
-- 슬라이드 수는 입력 내용 기준으로 자동 결정 (보통 5~8장)
-- 각 슬라이드는 title, summary, bullets, pageNum, notes 구성
-
-## JSON 스키마
-{
-  "slides": [
-    {
-      "title": "01 슬라이드 제목",
-      "summary": "이 슬라이드의 핵심 한 문장 요약",
-      "bullets": [
-        "첫 번째 핵심 항목",
-        "두 번째 핵심 항목",
-        "세 번째 핵심 항목"
-      ],
-      "pageNum": 1,
-      "notes": "발표자 노트 (선택사항)"
-    }
-  ]
-}
-
-## 슬라이드 구성 원칙
-- title: "번호 제목" 형식 (예: "01 프로젝트 배경")
-- summary: 슬라이드 전체를 한 문장으로 요약
-- bullets: 핵심 항목 3~5개, 각 항목은 간결하게 (1~2줄)
-- pageNum: 순서대로 자동 부여
-- 제안서 구조: 배경 → 목적 → 범위 → 로드맵 → 수행실적 → 추진일정
-- 보고서 구조: 현황 → 분석 → 문제점 → 전략 → 실행방안 → 기대효과
-
-## 중요
-- bullets 항목은 템플릿의 본문 텍스트 영역에 들어갈 내용
-- 너무 길면 잘리므로 각 항목은 40자 이내로 작성
-- 내용이 많으면 슬라이드를 나눠서 구성"""
-
-
-# ──────────────────────────────────────────────
-# Claude API 호출 함수
-# ──────────────────────────────────────────────
-
-def call_claude_api(content: str, template_info: dict = None) -> dict:
+def _extract_slide_structure(pptx_path: str) -> list:
     """
-    프로젝트 내용(줄글)을 slides_json으로 변환합니다.
-    template_info가 있으면 템플릿 구조를 참고하여 슬라이드 수를 조정합니다.
+    템플릿 각 슬라이드의 real_body_candidates 개수를 반환.
+    ppt_builder의 Shape 분류 로직과 동일한 기준 적용.
     """
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-    # 템플릿 정보가 있으면 슬라이드 수 힌트 추가
-    user_message = content
-    if template_info:
-        slide_count = len(template_info.get("existing_slides", []))
-        if slide_count > 0:
-            user_message = (
-                f"[템플릿 정보]\n"
-                f"- 템플릿 슬라이드 수: {slide_count}장\n"
-                f"- 폰트: {', '.join(template_info.get('fonts', []))}\n\n"
-                f"[프로젝트 내용]\n{content}"
-            )
-
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4000,
-        system=PPT_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
+    from pptx import Presentation
+    from ppt_builder import (
+        _find_title_shape,
+        _find_pagenum_shape,
+        _find_summary_shape,
+        _has_real_text,
     )
 
-    raw_text = message.content[0].text.strip()
+    prs = Presentation(pptx_path)
+    structure = []
 
-    # JSON 파싱 (코드블록 제거 후)
-    clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean_text)
+    for i, slide in enumerate(prs.slides):
+        text_shapes = [s for s in slide.shapes if s.has_text_frame]
+
+        title_sh   = _find_title_shape(text_shapes)
+        pagenum_sh = _find_pagenum_shape(text_shapes)
+        remaining  = [s for s in text_shapes if s is not title_sh and s is not pagenum_sh]
+        summary_sh = _find_summary_shape(remaining)
+
+        body_candidates      = [s for s in remaining if s is not summary_sh]
+        real_body_candidates = [s for s in body_candidates if _has_real_text(s)]
+
+        structure.append({
+            "slide_index"     : i,
+            "real_body_count" : len(real_body_candidates),
+            "real_body_names" : [s.name for s in real_body_candidates],
+            "has_table"       : any(s.has_table for s in slide.shapes),
+            "title_preview"   : title_sh.text.strip()[:30] if title_sh else "",
+        })
+
+    return structure
 
 
 # ──────────────────────────────────────────────
@@ -108,174 +59,188 @@ def call_claude_api(content: str, template_info: dict = None) -> dict:
 # ──────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
-def health_check():
+def health():
     return jsonify({"status": "ok", "message": "PPT 생성 서버 가동 중"})
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    """
+    템플릿 .pptx 분석 → 슬라이드 구조 반환
+    multipart/form-data: template (file)
+    """
     if "template" not in request.files:
-        return jsonify({"error": "template 파일이 필요합니다 (multipart/form-data)"}), 400
+        return jsonify({"error": "template 파일이 필요합니다."}), 400
 
     template_file = request.files["template"]
 
-    if not template_file.filename or not template_file.filename.lower().endswith(".pptx"):
-        return jsonify({"error": "템플릿 파일은 .pptx 형식이어야 합니다"}), 400
-
-    tmp_dir = tempfile.mkdtemp(prefix="ppt_analyze_")
-    template_path = os.path.join(tmp_dir, "template.pptx")
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
+        template_path = tmp.name
+        template_file.save(template_path)
 
     try:
-        template_file.save(template_path)
-        result = analyze_template(template_path)
-    except Exception as e:
-        return jsonify({"error": f"템플릿 분석 실패: {e}"}), 500
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        basic_info      = analyze_template(template_path)
+        slide_structure = _extract_slide_structure(template_path)
 
-    return jsonify(result)
+        return jsonify({
+            "basic_info"     : basic_info,
+            "slide_structure": slide_structure,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        os.unlink(template_path)
 
 
 @app.route("/generate-ppt", methods=["POST"])
 def generate_ppt():
     """
-    기존 엔드포인트: slides_json을 직접 받아서 PPT 생성
-    (Make.com에서 직접 JSON을 전달할 때 사용)
+    slides_json 직접 입력 → PPTX 생성
+    multipart/form-data: template (file), slides_json (text), title (text, optional)
     """
     if "template" not in request.files:
-        return jsonify({"error": "template 파일이 필요합니다 (multipart/form-data)"}), 400
-
-    slides_json_str = request.form.get("slides_json", "").strip()
-    if not slides_json_str:
-        return jsonify({"error": "slides_json이 필요합니다"}), 400
+        return jsonify({"error": "template 파일이 필요합니다."}), 400
+    if "slides_json" not in request.form:
+        return jsonify({"error": "slides_json이 필요합니다."}), 400
 
     template_file = request.files["template"]
-    title = request.form.get("title", "").strip()
+    slides_json   = request.form["slides_json"]
+    title         = request.form.get("title", "output")
 
-    if not template_file.filename or not template_file.filename.lower().endswith(".pptx"):
-        return jsonify({"error": "템플릿 파일은 .pptx 형식이어야 합니다"}), 400
-
-    try:
-        slides_json = json.loads(slides_json_str)
-    except json.JSONDecodeError as e:
-        return jsonify({"error": f"slides_json 파싱 실패: {e}"}), 400
-
-    if not slides_json.get("slides"):
-        return jsonify({"error": "slides_json에 slides 배열이 없습니다"}), 400
-
-    tmp_dir = tempfile.mkdtemp(prefix="ppt_gen_")
-    template_path = os.path.join(tmp_dir, "template.pptx")
-
-    output_name = secure_filename(title) if title else f"presentation_{uuid.uuid4().hex[:8]}"
-    if not output_name.lower().endswith(".pptx"):
-        output_name += ".pptx"
-    output_path = os.path.join(tmp_dir, output_name)
-
-    try:
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
+        template_path = tmp.name
         template_file.save(template_path)
-        build_ppt(template_path, slides_json, output_path)
 
-        with open(output_path, "rb") as f:
-            ppt_bytes = io.BytesIO(f.read())
+    output_path = tempfile.mktemp(suffix=".pptx")
 
+    try:
+        slides_data = json.loads(slides_json)
+        build_ppt(template_path, slides_data, output_path)
+        return send_file(
+            output_path,
+            mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            as_attachment=True,
+            download_name=f"{title}.pptx",
+        )
     except Exception as e:
-        return jsonify({"error": f"PPT 생성 실패: {e}"}), 500
+        return jsonify({"error": str(e)}), 500
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    ppt_bytes.seek(0)
-    return send_file(
-        ppt_bytes,
-        as_attachment=True,
-        download_name=output_name,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument"
-            ".presentationml.presentation"
-        ),
-    )
+        os.unlink(template_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
 
 
 @app.route("/generate-ppt-auto", methods=["POST"])
 def generate_ppt_auto():
     """
-    핵심 엔드포인트: 줄글 입력 → Claude API → slides_json → PPTX 생성
-
-    입력 (multipart/form-data):
-      - template: .pptx 파일
-      - content:  프로젝트 내용 줄글 (필수)
-      - title:    파일명 (선택)
-
-    출력:
-      - .pptx 파일
+    템플릿 구조 분석 → Claude JSON 생성 → PPTX 생성 (핵심 엔드포인트)
+    multipart/form-data:
+      - template     : .pptx 파일
+      - content      : 프로젝트 내용 줄글
+      - title        : 파일명 (선택)
     """
-    # ── 입력 검증 ──────────────────────────────
     if "template" not in request.files:
-        return jsonify({"error": "template 파일이 필요합니다 (multipart/form-data)"}), 400
-
-    content = request.form.get("content", "").strip()
-    if not content:
-        return jsonify({"error": "content(프로젝트 내용)가 필요합니다"}), 400
+        return jsonify({"error": "template 파일이 필요합니다."}), 400
+    if "content" not in request.form:
+        return jsonify({"error": "content가 필요합니다."}), 400
 
     template_file = request.files["template"]
-    title = request.form.get("title", "").strip()
+    content       = request.form["content"]
+    title         = request.form.get("title", "output")
 
-    if not template_file.filename or not template_file.filename.lower().endswith(".pptx"):
-        return jsonify({"error": "템플릿 파일은 .pptx 형식이어야 합니다"}), 400
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return jsonify({"error": "ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다"}), 500
-
-    # ── 임시 디렉토리 설정 ─────────────────────
-    tmp_dir = tempfile.mkdtemp(prefix="ppt_auto_")
-    template_path = os.path.join(tmp_dir, "template.pptx")
-
-    output_name = secure_filename(title) if title else f"presentation_{uuid.uuid4().hex[:8]}"
-    if not output_name.lower().endswith(".pptx"):
-        output_name += ".pptx"
-    output_path = os.path.join(tmp_dir, output_name)
-
-    try:
-        # 1) 템플릿 저장
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
+        template_path = tmp.name
         template_file.save(template_path)
 
-        # 2) 템플릿 분석 (슬라이드 수 파악 → Claude 힌트 제공)
-        template_info = analyze_template(template_path)
+    output_path = tempfile.mktemp(suffix=".pptx")
 
-        # 3) Claude API → slides_json 생성
-        slides_json = call_claude_api(content, template_info)
+    try:
+        # ── 1. 템플릿 구조 분석
+        slide_structure = _extract_slide_structure(template_path)
+        print(f"[generate-ppt-auto] 템플릿 구조: {slide_structure}")
 
-        # 4) ppt_builder → PPTX 생성
-        build_ppt(template_path, slides_json, output_path)
+        # ── 2. 구조 기반 Claude 프롬프트 생성
+        structure_desc = "\n".join([
+            f"- 슬라이드 {s['slide_index'] + 1}: "
+            f"본문 슬롯 {s['real_body_count']}개 "
+            f"(제목 미리보기: '{s['title_preview']}')"
+            for s in slide_structure
+        ])
 
-        # 5) 메모리로 읽어 반환
-        with open(output_path, "rb") as f:
-            ppt_bytes = io.BytesIO(f.read())
+        bullet_rules = "\n".join([
+            f"- 슬라이드 {s['slide_index'] + 1}: bullets 반드시 {s['real_body_count']}개"
+            if s['real_body_count'] > 0
+            else f"- 슬라이드 {s['slide_index'] + 1}: bullets 빈 배열 []"
+            for s in slide_structure
+        ])
 
+        prompt = f"""아래 프로젝트 내용을 분석해서 PPT 슬라이드 구조를 JSON으로 만들어줘.
+반드시 순수 JSON만 출력해. ```json 코드블록, 마크다운, 설명 텍스트 절대 포함하지 마. 첫 글자가 {{ 이고 마지막 글자가 }} 여야 해.
+
+[템플릿 구조 - 반드시 준수]
+이 템플릿은 {len(slide_structure)}개의 슬라이드로 구성됩니다.
+{structure_desc}
+
+[bullets 개수 규칙 - 절대 준수]
+{bullet_rules}
+
+[프로젝트 내용]
+{content}
+
+[출력 형식]
+{{
+  "slides": [
+    {{
+      "layout": "card",
+      "title": "01 슬라이드 제목",
+      "summary": "한 줄 요약",
+      "bullets": ["항목1", "항목2", "항목3", "항목4"],
+      "pageNum": 1
+    }}
+  ]
+}}
+
+[레이아웃 규칙]
+- 비교·나열 → card
+- 단계·순서 → process
+- 데이터·실적 → table
+- 범위·구조 → category
+- 일정 → gantt (bullets 형식: "기간 | 단계 | 내용")
+"""
+
+        # ── 3. Claude API 호출
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        raw_text = message.content[0].text.strip()
+        print(f"[generate-ppt-auto] Claude 응답 미리보기: {raw_text[:200]}")
+
+        # ── 4. JSON 파싱
+        slides_data = json.loads(raw_text)
+
+        # ── 5. PPTX 생성
+        build_ppt(template_path, slides_data, output_path)
+
+        return send_file(
+            output_path,
+            mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            as_attachment=True,
+            download_name=f"{title}.pptx",
+        )
     except json.JSONDecodeError as e:
-        return jsonify({"error": f"Claude API 응답 JSON 파싱 실패: {e}"}), 500
-    except anthropic.APIError as e:
-        return jsonify({"error": f"Claude API 오류: {e}"}), 500
+        return jsonify({"error": f"Claude JSON 파싱 실패: {str(e)}", "raw": raw_text}), 500
     except Exception as e:
-        return jsonify({"error": f"PPT 생성 실패: {e}"}), 500
+        return jsonify({"error": str(e)}), 500
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        os.unlink(template_path)
+        if os.path.exists(output_path):
+            os.unlink(output_path)
 
-    ppt_bytes.seek(0)
-    return send_file(
-        ppt_bytes,
-        as_attachment=True,
-        download_name=output_name,
-        mimetype=(
-            "application/vnd.openxmlformats-officedocument"
-            ".presentationml.presentation"
-        ),
-    )
-
-
-# ──────────────────────────────────────────────
-# 진입점
-# ──────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+    app.run(host="0.0.0.0", port=port, debug=False)
