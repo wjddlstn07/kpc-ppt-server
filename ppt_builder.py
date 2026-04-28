@@ -1,10 +1,5 @@
 """
 ppt_builder.py - KPC 템플릿 기반 PPT 생성 모듈
-
-전략: 템플릿 슬라이드를 복사하여 텍스트 Shape을 교체
-  - 플레이스홀더 없음 / 일반 Shape 구성 전제
-  - slides_json의 각 슬라이드 index → 해당 템플릿 슬라이드 복사
-  - 템플릿 슬라이드 수보다 JSON 슬라이드가 많으면 마지막 템플릿 슬라이드 재사용
 """
 import copy
 
@@ -104,7 +99,6 @@ def build_ppt(template_path: str, slides_json: dict, output_path: str) -> str:
     for slide_idx, slide_data in enumerate(slides_data):
         tmpl_idx = min(slide_idx, template_count - 1)
         print(f"\n[슬라이드 {slide_idx + 1}] 템플릿 슬라이드 {tmpl_idx} 복사")
-
         slide = _add_slide_copy(prs, tmpl_sp_trees[tmpl_idx])
         _fill_slide(slide, slide_data)
 
@@ -154,6 +148,11 @@ def _pick_layout(prs: Presentation):
 # 3. 슬라이드 내용 채우기
 # ──────────────────────────────────────────────
 
+def _has_real_text(shape) -> bool:
+    """Shape에 실제 의미있는 텍스트가 있는지 확인 (공백·줄바꿈 제외, 최소 2자 이상)."""
+    return len(shape.text.strip()) >= 2
+
+
 def _fill_slide(slide, slide_data: dict) -> None:
     title_text   = slide_data.get("title", "")
     summary_text = slide_data.get("summary", "")
@@ -167,12 +166,18 @@ def _fill_slide(slide, slide_data: dict) -> None:
     pagenum_sh = _find_pagenum_shape(text_shapes)
     remaining  = [s for s in text_shapes if s is not title_sh and s is not pagenum_sh]
     summary_sh = _find_summary_shape(remaining)
-    body_candidates = [s for s in remaining if s is not summary_sh]
 
-    print(f"  title_shape      : {title_sh.name if title_sh else None}")
-    print(f"  summary_shape    : {summary_sh.name if summary_sh else None}")
-    print(f"  body_candidates  : {[s.name for s in body_candidates]}")
-    print(f"  pagenum_shape    : {pagenum_sh.name if pagenum_sh else None}")
+    all_body_candidates = [s for s in remaining if s is not summary_sh]
+
+    # ── 핵심 필터: 템플릿에 실제 텍스트가 있는 Shape만 콘텐츠 슬롯으로 인식
+    real_body_candidates  = [s for s in all_body_candidates if _has_real_text(s)]
+    empty_body_candidates = [s for s in all_body_candidates if not _has_real_text(s)]
+
+    print(f"  title_shape         : {title_sh.name if title_sh else None}")
+    print(f"  summary_shape       : {summary_sh.name if summary_sh else None}")
+    print(f"  real_body_candidates: {[s.name for s in real_body_candidates]} ({len(real_body_candidates)}개)")
+    print(f"  empty_body(장식용)  : {len(empty_body_candidates)}개 → 자동 clear")
+    print(f"  pagenum_shape       : {pagenum_sh.name if pagenum_sh else None}")
 
     # ── 제목
     if title_sh and title_text:
@@ -184,26 +189,28 @@ def _fill_slide(slide, slide_data: dict) -> None:
         _replace_text(summary_sh, summary_text)
         print(f"  → summary 채움: '{summary_text[:40]}'")
 
-    # ── 본문 (핵심 수정)
-    if bullets and body_candidates:
+    # ── 장식용 빈 Shape은 무조건 clear
+    for s in empty_body_candidates:
+        _clear_shape(s)
+
+    # ── 본문: real_body_candidates 기준으로 매핑
+    if bullets and real_body_candidates:
         n_bullets = len(bullets)
-        n_shapes  = len(body_candidates)
+        n_shapes  = len(real_body_candidates)
 
         # 위→아래, 왼→오른 순 정렬
         sorted_bodies = sorted(
-            body_candidates,
+            real_body_candidates,
             key=lambda s: (round(s.top / 100000), s.left)
         )
 
         if n_bullets == n_shapes:
-            # 카드형: 1:1 매핑
             print(f"  → 카드형 1:1 매핑 ({n_bullets}개)")
             for shape, bullet in zip(sorted_bodies, bullets):
                 _replace_text(shape, bullet)
                 print(f"     '{shape.name}' ← '{bullet[:30]}'")
 
         elif n_bullets < n_shapes:
-            # bullets 수가 적으면 앞 Shape부터 채우고 나머지 clear
             print(f"  → bullets({n_bullets}) < shapes({n_shapes}): 앞부터 채우고 나머지 clear")
             for i, shape in enumerate(sorted_bodies):
                 if i < n_bullets:
@@ -212,19 +219,17 @@ def _fill_slide(slide, slide_data: dict) -> None:
                     _clear_shape(shape)
 
         else:
-            # bullets 수가 더 많으면 단일 body에 전체 삽입
-            body_sh = _find_body_shape(body_candidates)
+            body_sh = _find_body_shape(real_body_candidates)
             print(f"  → bullets({n_bullets}) > shapes({n_shapes}): 단일 body에 삽입")
             if body_sh:
                 _replace_bullets(body_sh, bullets)
-            for s in body_candidates:
+            for s in real_body_candidates:
                 if s is not body_sh:
                     _clear_shape(s)
 
-    elif not bullets and body_candidates:
-        # bullets 없으면 body Shape 전부 clear (원본 텍스트 제거)
-        print(f"  → bullets 없음: body shapes {len(body_candidates)}개 clear")
-        for s in body_candidates:
+    elif not bullets and real_body_candidates:
+        print(f"  → bullets 없음: real body shapes {len(real_body_candidates)}개 clear")
+        for s in real_body_candidates:
             _clear_shape(s)
 
     # ── 페이지 번호
